@@ -8,13 +8,7 @@ const {createClient} = require('redis');
 const token = process.env.TELEGRAM_TOKEN;
 const bot = new TelegramBot(token, { polling: true });
 
-const client = createClient({
-    password: '0kC1btoPG1jUykFV7kLS5Y4dCgFAh5PS',
-    socket: {
-        host: 'redis-12930.c262.us-east-1-3.ec2.cloud.redislabs.com',
-        port: 12930
-    }
-});
+const client = createClient(process.env.REDIS_URL);
 
 client.on('error', (err) => console.error('Redis Client Error', err));
 client.connect();
