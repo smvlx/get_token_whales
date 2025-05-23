@@ -3,15 +3,29 @@ const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const fs = require('fs');
-const {createClient} = require('redis');
+const { createClient } = require('redis');
 
 const token = process.env.TELEGRAM_TOKEN;
 const bot = new TelegramBot(token, { polling: true });
 
-const client = createClient(process.env.REDIS_URL);
+// Redis client initialization using official format
+const client = createClient({
+  username: process.env.REDIS_USERNAME,
+  password: process.env.REDIS_PASSWORD,
+  socket: {
+    host: process.env.REDIS_URI,
+    port: process.env.REDIS_PORT
+  }
+});
 
-client.on('error', (err) => console.error('Redis Client Error', err));
-client.connect();
+client.on('error', err => console.error('Redis Client Error:', err));
+client.on('connect', () => console.log('Redis Client connecting...'));
+client.on('ready', () => console.log('Redis Client connected successfully'));
+
+// Initialize Redis connection
+(async () => {
+  await client.connect();
+})();
 
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const heliusUrl = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
