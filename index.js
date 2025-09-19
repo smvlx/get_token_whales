@@ -30,6 +30,9 @@ client.on('ready', () => console.log('Redis Client connected successfully'));
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const heliusUrl = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
+// Add logging to debug the API key
+console.log('Helius API Key:', HELIUS_API_KEY ? 'Present' : 'Missing');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -41,27 +44,103 @@ app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
 
-// Delay function
-const fetchWithRetry = async (url, options, retries = 5, delayMs = 5000) => {
+// Enhanced retry function with exponential backoff
+const fetchWithRetry = async (url, options, retries = 5, initialDelayMs = 2000) => {
     for (let i = 0; i < retries; i++) {
       try {
-        const response = await axios(url, options);
+        // Add timeout to axios request
+        const axiosOptions = {
+          ...options,
+          timeout: 30000, // 30 second timeout
+        };
+        
+        const response = await axios(url, axiosOptions);
+        recordSuccess(); // Record successful API call
         return response;
       } catch (error) {
-        if (error.response && error.response.status === 429) { // Rate limit exceeded
-          const retryAfter = error.response.headers['retry-after'];
-          const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : delayMs;
-          console.log(`Rate limit exceeded, retrying in ${waitTime}ms...`);
-          await delay(waitTime);
-        } else {
-          throw error;
+        const isLastAttempt = i === retries - 1;
+        
+        if (error.response) {
+          const status = error.response.status;
+          
+          if (status === 429) { // Rate limit exceeded
+            const retryAfter = error.response.headers['retry-after'];
+            const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : initialDelayMs * Math.pow(2, i);
+            console.log(`Rate limit exceeded (attempt ${i + 1}/${retries}), retrying in ${waitTime}ms...`);
+            
+            if (!isLastAttempt) {
+              await delay(waitTime);
+              continue;
+            }
+          } else if (status === 504 || status === 502 || status === 503) { // Gateway errors
+            const waitTime = initialDelayMs * Math.pow(2, i); // Exponential backoff
+            console.log(`Gateway error ${status} (attempt ${i + 1}/${retries}), retrying in ${waitTime}ms...`);
+            
+            if (!isLastAttempt) {
+              await delay(waitTime);
+              continue;
+            }
+          }
+        } else if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+          // Handle timeout errors
+          const waitTime = initialDelayMs * Math.pow(2, i);
+          console.log(`Request timeout (attempt ${i + 1}/${retries}), retrying in ${waitTime}ms...`);
+          
+          if (!isLastAttempt) {
+            await delay(waitTime);
+            continue;
+          }
         }
+        
+        // If we reach here, either it's the last attempt or an unretryable error
+        if (isLastAttempt) {
+          console.error(`Max retries (${retries}) exceeded for ${url}`);
+          recordFailure(); // Record failure for circuit breaker
+        }
+        throw error;
       }
     }
     throw new Error("Max retries exceeded");
   };
   
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// Circuit breaker to prevent overwhelming the API when it's having issues
+let circuitBreakerState = {
+  failureCount: 0,
+  lastFailureTime: 0,
+  isOpen: false
+};
+
+const CIRCUIT_BREAKER_THRESHOLD = 3; // Number of failures before opening circuit
+const CIRCUIT_BREAKER_TIMEOUT = 300000; // 5 minutes
+
+const checkCircuitBreaker = () => {
+  if (circuitBreakerState.isOpen) {
+    const timeSinceLastFailure = Date.now() - circuitBreakerState.lastFailureTime;
+    if (timeSinceLastFailure > CIRCUIT_BREAKER_TIMEOUT) {
+      // Reset circuit breaker
+      circuitBreakerState.isOpen = false;
+      circuitBreakerState.failureCount = 0;
+      console.log('Circuit breaker reset - attempting API calls again');
+    }
+  }
+  return circuitBreakerState.isOpen;
+};
+
+const recordFailure = () => {
+  circuitBreakerState.failureCount++;
+  circuitBreakerState.lastFailureTime = Date.now();
+  
+  if (circuitBreakerState.failureCount >= CIRCUIT_BREAKER_THRESHOLD) {
+    circuitBreakerState.isOpen = true;
+    console.log(`Circuit breaker opened after ${circuitBreakerState.failureCount} failures`);
+  }
+};
+
+const recordSuccess = () => {
+  circuitBreakerState.failureCount = Math.max(0, circuitBreakerState.failureCount - 1);
+};
 
 // Define the escapeMarkdown function
 const escapeMarkdown = (text) => {
@@ -98,6 +177,11 @@ const formatHolders = (holders, mint) => {
 };
   
 const findHolders = async (mint) => {
+  // Check circuit breaker
+  if (checkCircuitBreaker()) {
+    throw new Error('API service is temporarily unavailable due to repeated failures. Please try again later.');
+  }
+
   // Check cache
   const cachedData = await client.get(mint);
   if (cachedData) {
@@ -148,7 +232,7 @@ const findHolders = async (mint) => {
   const topOwners = allOwners.slice(0, 20);
 
   for (const owner of topOwners) {
-    await delay(500); // Add a delay of 500ms between requests
+    await delay(1000); // Increased delay to 1s between requests to reduce load
     const response = await fetchWithRetry(heliusUrl, {
       method: 'POST',
       headers: {
@@ -420,11 +504,31 @@ const fetchSnapshot = async (chatId, contractAddress) => {
     }
   } catch (error) {
     console.error('Error in fetchSnapshot:', error);
-    if (error instanceof AggregateError) {
-      bot.sendMessage(chatId, `Failed to fetch holder snapshot: Multiple errors occurred. Please try again later.`);
+    
+    let errorMessage = 'Failed to fetch holder snapshot. ';
+    
+    if (error.response) {
+      const status = error.response.status;
+      if (status === 504) {
+        errorMessage += 'The API server is experiencing high load. Please try again in a few minutes.';
+      } else if (status === 502 || status === 503) {
+        errorMessage += 'The API server is temporarily unavailable. Please try again later.';
+      } else if (status === 429) {
+        errorMessage += 'Rate limit exceeded. Please wait a moment before trying again.';
+      } else if (status === 401) {
+        errorMessage += 'API authentication issue. Please contact support.';
+      } else {
+        errorMessage += `Server error (${status}). Please try again later.`;
+      }
+    } else if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+      errorMessage += 'Request timed out. The API may be experiencing high load. Please try again.';
+    } else if (error instanceof AggregateError) {
+      errorMessage += 'Multiple errors occurred. The service may be temporarily unavailable.';
     } else {
-      bot.sendMessage(chatId, `Failed to fetch holder snapshot: ${error.message}`);
+      errorMessage += error.message || 'An unexpected error occurred.';
     }
+    
+    bot.sendMessage(chatId, errorMessage);
   }
 };
 
